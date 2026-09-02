@@ -45,3 +45,13 @@ VIEWER_PUSH_URL = os.getenv("VIEWER_PUSH_URL", "")
 BROWSER_VIEWER_ENABLED = os.getenv("BROWSER_VIEWER_ENABLED", "1") == "1"
 VIEWER_FPS = int(os.getenv("VIEWER_FPS", "12"))
 VIEWER_QUALITY = int(os.getenv("VIEWER_QUALITY", "75"))
+
+# --- FC (ArduPilot) + Drone ---
+FC_CONNECTION_STRING = os.getenv("FC_CONNECTION_STRING", "/dev/ttyACM0")
+FC_BAUD = int(os.getenv("FC_BAUD", "57600"))
+TELEMETRY_HZ = int(os.getenv("TELEMETRY_HZ", "10"))
+TELEMETRY_STALE_MS = int(os.getenv("TELEMETRY_STALE_MS", "100"))
+DETECTION_SAVE_DIR = os.getenv("DETECTION_SAVE_DIR", "data/detections")
+DETECTION_SAVE_THROTTLE_MS = int(os.getenv("DETECTION_SAVE_THROTTLE_MS", "1000"))
+GUIDED_ALT_DEFAULT = float(os.getenv("GUIDED_ALT_DEFAULT", "20"))
+API_KEY = os.getenv("API_KEY", "secret")

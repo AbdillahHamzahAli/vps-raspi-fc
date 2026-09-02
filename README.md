@@ -1,17 +1,28 @@
-# vps-raspi-fc — WebRTC 2-Arah VPS ↔ Raspi
+# vps-raspi-fc — Drone 2-Arah VPS ↔ Raspi ↔ FC (ArduPilot)
 
-**Raspi -> VPS**: Video USB cam (VP8/H264) via WebRTC MediaTrack, latency target <200ms  
-**VPS -> Raspi**: Hasil YOLO11s via WebRTC DataChannel, Raspi `print()` (contoh trigger script)
+**Raspi (drone) → VPS**: Video USB cam (VP8/H264) + koordinat FC **sinkron ≤100ms** via WebRTC VideoTrack + DataChannel `telemetry` (fallback WS)  
+**VPS → Raspi**: Hasil YOLO11s via DataChannel `detection` + perintah **GUIDED** ke koordinat via `raspi/pkg` (pymavlink)  
+**VPS storage**: Frame + `.json` (koordinat) dengan nama sama `YYYYMMDD_HHMMSS_ms_frameId_cls_conf`
 
-Jaringan modem/CGNAT → wajib TURN (`coturn` di VPS).
+Jaringan modem/CGNAT → wajib TURN (`coturn` di VPS). FC konek Raspi via USB/UART (config `.env` `FC_CONNECTION_STRING`).
 
 ## Arsitektur
 
 ```
-[Raspi - modem] --VideoTrack--> [VPS - YOLO11s] --DataChannel JSON--> [Raspi print]
-                <-DataChannel--                --signaling WS:8000--
-TURN: coturn di VPS :3478 + STUN
+[Drone]
+  USB cam ──┐
+            ├─ [Raspi] ─ UsbCameraTrack (frame_id++) ─┐
+  FC (USB) ─┘   └─ raspi/pkg.Vehicle (pymavlink 10Hz) ─┤─ DataChannel telemetry {frame_id, ts, lat,lon,alt} (100ms)
+                └─ DC commands RX {type:guided} ───────┘  DataChannel commands {detection, guided_ack}
+                         ↕ WebRTC (TURN :3478) + WS signaling :8000 (VPS)
+
+[VPS]
+  main_vps: consume VideoTrack + telemetry buffer → YOLO → if dets → storage.py save jpg+json (pakai koordinat terdekat)
+  signaling_server: FastAPI WS relay + REST API + static /detections
 ```
+
+* Raspi `raspi/pkg` (mirip `guided-dropping-mission`): `Vehicle` + `MAVState` + `utils.horizontal_distance_m` — luar cukup `await vehicle.send_guided(lat,lon,alt)` dan `vehicle.get_position()`
+* Sinkron: Raspi kirim `telemetry` tiap `TELEMETRY_HZ=10` dengan `frame_id`; VPS buffer `OrderedDict` 200 entri, cari `frame_id` exact lalu `latest` dalam `TELEMETRY_STALE_MS=100`
 
 ## Quick Start
 
@@ -19,7 +30,7 @@ TURN: coturn di VPS :3478 + STUN
 
 ```bash
 uv sync
-cp .env.example .env   # edit VPS_IP, TURN cred
+cp .env.example .env   # edit VPS_IP, TURN cred, FC_CONNECTION_STRING, API_KEY
 ```
 
 ### 2. VPS — Signaling + TURN
@@ -27,40 +38,41 @@ cp .env.example .env   # edit VPS_IP, TURN cred
 ```bash
 # di VPS
 sudo bash scripts/setup_coturn.sh
-# buka firewall
 sudo ufw allow 8000/tcp && sudo ufw allow 3478/tcp && sudo ufw allow 3478/udp && sudo ufw allow 49160:49200/udp
 
-# jalankan signaling
 uv run uvicorn vps.signaling_server:app --host 0.0.0.0 --port 8000
-# test: curl http://VPS_IP:8000/  -> {"status":"ok", "peers":[]}
+# test: curl http://VPS_IP:8000/  -> {"status":"ok", "peers":[], "detections":0}
 ```
 
 ### 3. VPS — Receiver + YOLO11s
 
 ```bash
 # di VPS (terminal 2)
-# .env: SIGNALING_URL=ws://localhost:8000/ws  jika 1 mesin, atau ws://VPS_IP:8000/ws
-# YOLO11s akan auto-download yolo11s.pt di first run
 uv run python -m vps.main_vps
-# log: [vps] waiting for offer...
-# saat Raspi connect: DETECTED [{"cls":"person","conf":0.91,...}] -> kirim DataChannel
+# log: [vps] waiting for offers...
+# saat Raspi connect: DETECTED [...] + [storage] saved 20260902_..._person_0.92.jpg
 ```
 
-### 4. Raspi — USB Cam + Trigger Print
+### 4. Raspi — USB Cam + FC (pilih salah satu FC)
 
 ```bash
-# di Raspi
-# .env: SIGNALING_URL=ws://VPS_IP:8000/ws, CAM_DEVICE=0
-uv run python -m raspi.main_raspi
-# log: [raspi] offer created, DataChannel OPEN
-# saat VPS deteksi: 
-# ============================================================
-# [TRIGGER 2026-08-29 12:00:00] Dari VPS:
-# {
-#   "type": "detection",
-#   "objects": [{"cls": "person", "conf": 0.92, "xyxy": [10,20,200,400]}]
-# }
-# ============================================================
+# Real drone: FC via USB
+FC_CONNECTION_STRING=/dev/ttyACM0 FC_BAUD=57600 uv run python -m raspi.main_raspi
+
+# SITL Mission Planner (Windows/WSL): MP sudah connect udp:127.0.0.1:14550
+FC_CONNECTION_STRING=udp:127.0.0.1:14550 uv run python -m raspi.main_raspi
+# jika MP bind port -> pakai udpin:
+FC_CONNECTION_STRING=udpin:127.0.0.1:14550 uv run python -m raspi.main_raspi
+# log: [pkg] heartbeat sys 1 comp 1 via udp..., [raspi] DataChannel OPEN, telemetry
+```
+
+Jika deteksi: Raspi print `[TRIGGER]` + VPS simpan `data/detections/`.
+
+### 5. Test Mission Planner (tanpa download SITL)
+
+```bash
+bash scripts/test_missionplanner.sh
+# cek FC 5s, lalu instruksi 3 terminal di atas
 ```
 
 ## Konfigurasi Penting (.env)
@@ -68,64 +80,148 @@ uv run python -m raspi.main_raspi
 | Key | Default | Ket |
 |---|---|---|
 | `SIGNALING_URL` | `ws://localhost:8000/ws` | WS signaling di VPS |
-| `TURN_URL` | `turn:VPS_IP:3478` | Wajib untuk modem |
+| `TURN_URL` | `turn:VPS_IP:3478` | Wajib modem |
 | `CAM_DEVICE` | `0` | `/dev/video0` atau `0` |
 | `VIDEO_WIDTH/HEIGHT/FPS` | `640x480@20` | Turunkan jika latency >200ms |
 | `YOLO_MODEL` | `yolo11s.pt` | Auto download |
 | `YOLO_CONF` | `0.5` | Threshold |
-| `YOLO_CLASSES` | `` | Kosong semua, `0` = person only |
+| `YOLO_CLASSES` | `` | `0`=person only |
 | `DETECTION_THROTTLE_MS` | `200` | Max 5 msg/detik |
+| `FC_CONNECTION_STRING` | `/dev/ttyACM0` | SITL: `udp:127.0.0.1:14550` |
+| `FC_BAUD` | `57600` | Baud serial |
+| `TELEMETRY_HZ` | `10` | Hz kirim koordinat |
+| `TELEMETRY_STALE_MS` | `100` | Budget sinkron |
+| `DETECTION_SAVE_DIR` | `data/detections` | Storage VPS |
+| `DETECTION_SAVE_THROTTLE_MS` | `1000` | Anti spam save |
+| `GUIDED_ALT_DEFAULT` | `20` | Alt relatif AGL (m) |
+| `API_KEY` | `secret` | **Ganti!** untuk produksi |
+| `FC_Q_GUIDED_MODE` | `1` | QuadPlane Q_GUIDED |
+| `FC_ARRIVAL_RADIUS_M` | `5.0` | Radius arrival |
+| `FC_ARRIVAL_SPEED_MPS` | `0.5` | Speed arrival |
 
-## Test Tanpa Hardware
+## REST API (VPS)
 
-- **Tanpa USB cam**: `raspi/capture.py` otomatis kirim black frame dengan timestamp (tetap bisa test signaling & DataChannel).
-- **Tanpa YOLO**: Jika `ultralytics` belum install, detector jadi dummy (tidak deteksi) tapi DataChannel tetap jalan. Test trigger manual: di VPS `data_channel.send('{"type":"trigger","msg":"hello"}')`.
+Semua butuh header `X-API-Key: <API_KEY>` atau `Authorization: Bearer <API_KEY>`.
+
+### List deteksi
+```bash
+curl -H "X-API-Key: secret" "http://VPS_IP:8000/api/detections?limit=50&offset=0" | jq
+# {"ok":true,"total":12,"items":[{"id":"20260902_143001_123_person_0.92","ts":...,"coords":{"lat":-7.28,"lon":112.79,"alt":15,"rel_alt":15},"detections":[...],"image":"/detections/20260902_...jpg"}]}
+```
+
+### Detail + koordinat
+```bash
+curl -H "X-API-Key: secret" http://VPS_IP:8000/api/detections/20260902_143001_123_person_0.92 | jq
+curl -H "X-API-Key: secret" http://VPS_IP:8000/detections/20260902_143001_123_person_0.92.jpg --output frame.jpg
+curl -H "X-API-Key: secret" http://VPS_IP:8000/detections/20260902_143001_123_person_0.92.json | jq
+```
+
+### Kirim GUIDED ke koordinat (alt relatif)
+```bash
+curl -X POST -H "X-API-Key: secret" -H "Content-Type: application/json" \
+  -d '{"lat":-7.28,"lon":112.79,"alt":10}' http://VPS_IP:8000/api/guided | jq
+# {"ok":true,"via":"ws","sent":{"type":"guided","lat":-7.28,...}}
+# via: ws (2 proses) atau datachannel (embedded). Butuh raspi connect else 503
+# 401 tanpa key, 400 lat out of range
+```
+Raspi `raspi/pkg.Vehicle` akan `set_mode GUIDED` → `mission_item_int_send` → `MISSION_ACK`. Cek MP HUD mode GUIDED.
+
+### Health
+```bash
+curl http://VPS_IP:8000/ | jq
+# {"status":"ok","peers":["raspi","vps"],"detections":12,"raspi_connected":true}
+```
+
+## Storage
+
+`data/detections/` di VPS (gitignore). Tiap deteksi:
+```
+20260902_143001_123_person_0.92.jpg  # frame annotasi
+20260902_143001_123_person_0.92.json # {"id","ts","frame_id","coords":{"lat","lon","alt","rel_alt","ts","speed","mock"},"detections":[...],"coords_stale_ms":12}
+```
 
 ## Browser Viewer (Stream Detection)
 
-VPS otomatis push frame terannotasi YOLO11s ke signaling server, browser bisa lihat tanpa WebRTC:
+VPS push frame annotasi ke signaling:
 
-- **Viewer**: `http://VPS_IP:8000/viewer` — MJPEG + canvas overlay box hijau
-- **Raw MJPEG**: `http://VPS_IP:8000/stream.mjpg` — bisa di `<img>` atau VLC
-- **API state**: `http://VPS_IP:8000/api/state` — JSON detections terakhir
-- **WS live**: `ws://VPS_IP:8000/ws/viewer` — broadcast detections real-time
+- **Viewer**: `http://VPS_IP:8000/viewer` — MJPEG + canvas overlay
+- **Raw MJPEG**: `http://VPS_IP:8000/stream.mjpg`
+- **API state**: `http://VPS_IP:8000/api/state`
+- **WS live**: `ws://VPS_IP:8000/ws/viewer`
 
-Cara:
 ```bash
-# 1. signaling sudah jalan :8000
-# 2. VPS jalan (akan push ke /api/frame tiap ada deteksi)
 uv run python -m vps.main_vps
-# 3. buka di laptop/HP:
 open http://VPS_IP:8000/viewer
-open http://localhost:8000/viewer   # untuk test lokal 1 laptop
 ```
 
-Di viewer kamu lihat: stream 640x480 + box `person 88%` + JSON list. Raspi tetap dapat trigger via DataChannel (print) — viewer hanya display.
+## Raspi pkg — Guided Abstraction
 
-Test lokal sudah terbukti: VPS push `POST /api/frame` 50+ kali, `/api/state` has_frame=true, `/stream.mjpg` ngalir.
+Luar hanya panggil `raspi/pkg` (port dari `guided-dropping-mission`):
+
+```python
+from raspi.pkg import get_vehicle, Target
+
+vehicle = get_vehicle()  # baca FC_CONNECTION_STRING dari .env
+await vehicle.connect(timeout=10)  # fallback mock jika FC mati, udpin fallback jika MP bind
+pos = vehicle.get_position()  # {"lat","lon","alt","rel_alt","speed","ts"}
+result = await vehicle.send_guided(lat=-7.28, lon=112.79, alt=10)
+# result {"ok":True, "target":{...}} atau {"ok":False,"error":...}
+
+# opsional:
+vehicle.ensure_q_guided_mode()
+vehicle.set_mode("GUIDED")
+vehicle.goto(Target(lat,lon,alt_m=10))
+vehicle.wait_arrival(Target(...))
+```
+
+`raspi/fc_interface.py` sekarang shim deprecated — pakai `raspi.pkg`.
+
+## Test Tanpa Hardware
+
+- **Tanpa USB cam**: black frame + timestamp otomatis.
+- **Tanpa FC**: mock GPS `lat -7.27, lon 112.79` + `mock:true` di json, `send_guided` mock `ok:true`.
+- **Tanpa YOLO**: dummy detector, DataChannel tetap jalan.
 
 ## Troubleshooting
 
-- **Peers tidak connect / ICE failed**: Cek `TURN_URL` & `coturn` status `systemctl status coturn`. Test `turnutils_uclient -u raspi -w pass -p 3478 VPS_IP`. Pastikan `SIGNALING_URL` pakai `VPS_IP` bukan `localhost` dari sisi Raspi.
-- **Latency >200ms**: Turunkan `VIDEO_WIDTH=640 HEIGHT=480 FPS=15 BITRATE=600`, set `YOLO_CLASSES=0` (person only), `DETECTION_EVERY_N_FRAMES=4`.
-- **Raspi CPU 100%**: Pakai `VIDEO_FPS=15`, atau ganti ke GStreamer `v4l2h264enc` (TODO).
-- **Signaling 404**: Pastikan server jalan `uvicorn ... --port 8000` dan `SIGNALING_URL` akhiri `/ws`.
-- **Viewer hitam / no-signal**: Tunggu 2-3 detik setelah VPS+raspi connect. Cek `curl http://VPS_IP:8000/api/state` has_frame harus true. Cek log VPS `[viewer] push` tidak error.
-- **Port 8000 bentrok**: Signaling + viewer jadi 1 port (8000). Jangan jalankan viewer terpisah di 8001.
+- **Peers tidak connect / ICE failed**: `systemctl status coturn`, `turnutils_uclient -u raspi -w pass -p 3478 VPS_IP`, pastikan `SIGNALING_URL` pakai `VPS_IP` bukan `localhost` dari Raspi.
+- **Latency >200ms**: turunkan `VIDEO_WIDTH=640 HEIGHT=480 FPS=15 BITRATE=600`, `YOLO_CLASSES=0`, `DETECTION_EVERY_N_FRAMES=4`.
+- **FC heartbeat timeout / mock**: cek `ls /dev/serial/by-id/*`, `FC_CONNECTION_STRING` benar, baud `57600`/`921600`, untuk SITL coba `udpin:127.0.0.1:14550` dan tambah UDP output di MP.
+- **Guided `503 raspi not connected`**: `curl http://VPS_IP:8000/` cek `peers`, pastikan Raspi `DataChannel OPEN` atau WS `guided` fallback.
+- **Guided `goto rejected`**: pastikan drone armed + mode GUIDED, cek `Q_GUIDED_MODE=1` untuk QuadPlane, cek `is_armed` di MP.
+- **Telemetry stale >100ms**: naikkan `TELEMETRY_HZ=15` atau turunkan `VIDEO_FPS`.
+- **Signaling 404**: `SIGNALING_URL` akhiri `/ws`.
+- **Viewer hitam**: `curl http://VPS_IP:8000/api/state` `has_frame` harus true.
 
 ```
-common/config.py        ICE + env + viewer push URL
-common/signaling.py     WS client helper
-vps/signaling_server.py FastAPI WS relay + viewer (/viewer, /stream.mjpg, /ws/viewer, POST /api/frame)
-static/viewer.html      Browser viewer MJPEG + canvas overlay + WS
-vps/detector.py         YOLO11s wrapper
-vps/main_vps.py         WebRTC receiver + detector + DataChannel sender + push viewer (aiohttp)
-raspi/capture.py        UsbCameraTrack (cv2)
-raspi/handler.py        print payload VPS (contoh trigger)
-raspi/main_raspi.py     WebRTC sender + DataChannel receiver
-scripts/setup_coturn.sh install TURN di VPS
-scripts/test_local.sh   Test 1 laptop (signaling + vps + raspi)
+common/config.py           ICE + env + viewer + FC
+common/signaling.py        WS client helper
+vps/signaling_server.py    FastAPI WS relay + viewer + /api/detections + /api/guided
+vps/storage.py             Save jpg+json sinkron koordinat
+vps/detector.py            YOLO11s wrapper
+vps/main_vps.py            WebRTC receiver + telemetry buffer 100ms + storage + push viewer
+raspi/pkg/                 FC pkg (Vehicle + MAVState + utils) — luar cukup get_vehicle()
+  - config.py              Config/Target dataclass
+  - state.py               MAVState cache thread
+  - vehicle.py             GUIDED via mission_item_int_send + MISSION_ACK
+  - utils.py               horizontal_distance_m
+raspi/capture.py           UsbCameraTrack (frame_id)
+raspi/handler.py           print payload VPS
+raspi/main_raspi.py        WebRTC sender + 2 DC (telemetry/commands) + handle_guided_via_pkg
+raspi/fc_interface.py      shim deprecated → raspi.pkg
+static/viewer.html         Browser viewer
+scripts/setup_coturn.sh    Install TURN di VPS
+scripts/test_local.sh      Test 1 laptop
+scripts/test_missionplanner.sh  Test MP SITL udp:127.0.0.1:14550
+data/detections/           Storage VPS (gitignore)
 ```
+
+## Keamanan
+
+- Ganti `API_KEY` dari `secret` default sebelum expose VPS ke public.
+- `/api/*` butuh `X-API-Key`, tapi `GET /detections/*.jpg` masih via static mount — untuk produksi tambah auth middleware atau reverse proxy `nginx` + auth.
+- `POST /api/guided` belum ada geofence/rate-limit — tambah validasi jarak dari home sebelum terbang jauh.
+- Gunakan `wss://`/`https://` + cert di produksi, jangan `ws://`.
 
 ## Next: Ganti print jadi aksi nyata
 
@@ -136,4 +232,4 @@ if data["type"]=="detection":
         if o["cls"]=="person" and o["conf"]>0.8:
             subprocess.run(["bash", "./scripts/buka_buzzer.sh"])
 ```
-Whitelist script di `ALLOWED_SCRIPTS`.
+Whitelist di `ALLOWED_SCRIPTS`.

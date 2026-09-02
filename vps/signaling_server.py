@@ -6,10 +6,10 @@ import time
 from pathlib import Path
 from typing import Dict, Set, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Header, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from common.config import get_ice_servers
+from common.config import get_ice_servers, API_KEY, DETECTION_SAVE_DIR, GUIDED_ALT_DEFAULT
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("signaling")
@@ -34,9 +34,35 @@ try:
 except:
     pass
 
+# Detection storage mount
+DETECTION_DIR = Path(DETECTION_SAVE_DIR).resolve()
+try:
+    DETECTION_DIR.mkdir(parents=True, exist_ok=True)
+    app.mount("/detections", StaticFiles(directory=str(DETECTION_DIR)), name="detections")
+except Exception as e:
+    logger.warning(f"[api] mount detections failed {e}")
+
+
+def require_api_key(x_api_key: str | None = Header(None), authorization: str | None = Header(None)):
+    # support X-API-Key or Authorization: Bearer <key>
+    key = x_api_key
+    if not key and authorization:
+        if authorization.lower().startswith("bearer "):
+            key = authorization[7:].strip()
+        else:
+            key = authorization.strip()
+    if key != API_KEY:
+        raise HTTPException(status_code=401, detail="invalid api key, set header X-API-Key")
+    return key
+
 @app.get("/")
 async def health():
-    return {"status": "ok", "peers": list(peers.keys()), "viewer": "/viewer", "stream": "/stream.mjpg"}
+    try:
+        from vps.storage import count_detections
+        det_count = count_detections()
+    except:
+        det_count = -1
+    return {"status": "ok", "peers": list(peers.keys()), "viewer": "/viewer", "stream": "/stream.mjpg", "detections": det_count, "raspi_connected": "raspi" in peers}
 
 @app.get("/peers")
 async def list_peers():
@@ -45,6 +71,89 @@ async def list_peers():
 @app.get("/api/ice")
 async def api_ice():
     return {"iceServers": get_ice_servers()}
+
+
+# ---- Detection + Guided API ----
+@app.get("/api/detections")
+async def api_list_detections(limit: int = 50, offset: int = 0, x_api_key: str | None = Header(None), authorization: str | None = Header(None)):
+    require_api_key(x_api_key, authorization)
+    # defensive bounds
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    try:
+        from vps.storage import list_detections
+        items = list_detections(limit=limit, offset=offset)
+        # also get total
+        from vps.storage import count_detections
+        total = count_detections()
+        return {"ok": True, "total": total, "limit": limit, "offset": offset, "items": items}
+    except Exception as e:
+        logger.exception(f"[api] list detections failed {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/detections/{det_id}")
+async def api_get_detection(det_id: str, x_api_key: str | None = Header(None), authorization: str | None = Header(None)):
+    require_api_key(x_api_key, authorization)
+    try:
+        from vps.storage import get_detection
+        data = get_detection(det_id)
+        if data is None:
+            return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+        return {"ok": True, "item": data}
+    except Exception as e:
+        logger.exception(f"[api] get detection failed {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/guided")
+async def api_post_guided(req: Request, x_api_key: str | None = Header(None), authorization: str | None = Header(None)):
+    require_api_key(x_api_key, authorization)
+    try:
+        body = await req.json()
+    except:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+    lat = body.get("lat")
+    lon = body.get("lon")
+    alt = body.get("alt", GUIDED_ALT_DEFAULT)
+    if lat is None or lon is None:
+        return JSONResponse({"ok": False, "error": "lat and lon required"}, status_code=400)
+    try:
+        lat = float(lat); lon = float(lon); alt = float(alt) if alt is not None else GUIDED_ALT_DEFAULT
+    except:
+        return JSONResponse({"ok": False, "error": "lat/lon/alt must be numbers"}, status_code=400)
+    if not (-90 <= lat <= 90):
+        return JSONResponse({"ok": False, "error": "lat out of range -90..90"}, status_code=400)
+    if not (-180 <= lon <= 180):
+        return JSONResponse({"ok": False, "error": "lon out of range -180..180"}, status_code=400)
+    if not (0 < alt < 10000):
+        return JSONResponse({"ok": False, "error": "alt out of range"}, status_code=400)
+
+    # 1) try DataChannel via vps.main_vps if embedded
+    dc_result = None
+    try:
+        from vps.main_vps import send_guided_via_dc
+        dc_result = await send_guided_via_dc(lat, lon, alt)
+        # if DC fallback flag, still do WS as well
+        if dc_result and dc_result.get("ok") and not dc_result.get("fallback"):
+            return {"ok": True, "via": "datachannel", "sent": {"lat": lat, "lon": lon, "alt": alt}, "result": dc_result}
+    except Exception as e:
+        logger.debug(f"[api] DC guided not available {e}")
+        dc_result = None
+
+    # 2) WS fallback: relay via signaling peers
+    target_ws = peers.get("raspi")
+    if target_ws is None:
+        return JSONResponse({"ok": False, "error": "raspi not connected", "via": "none", "dc_result": dc_result}, status_code=503)
+    try:
+        payload = {"type": "guided", "lat": lat, "lon": lon, "alt": alt}
+        await target_ws.send_text(json.dumps({**payload, "from": "vps"}))
+        # also broadcast to vps peer for main_vps to pick guided_ack
+        logger.info(f"[api] guided via WS lat={lat} lon={lon} alt={alt}")
+        return {"ok": True, "via": "ws", "sent": payload, "dc_result": dc_result}
+    except Exception as e:
+        logger.exception(f"[api] guided WS send failed {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 @app.get("/viewer", response_class=HTMLResponse)
 async def viewer():

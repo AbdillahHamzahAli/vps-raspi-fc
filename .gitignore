@@ -11,6 +11,8 @@ wheels/
 
 # Project
 .env
+data/detections/
+!data/.gitkeep
 yolo11*.pt
 *.pt
 /tmp/

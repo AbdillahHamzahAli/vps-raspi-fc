@@ -19,6 +19,7 @@ class UsbCameraTrack(VideoStreamTrack):
         self.device = device
         self.cap: cv2.VideoCapture | None = None
         self._frame_idx = 0
+        self.frame_id = 0  # public for telemetry sync
         self._open_camera()
 
     def _open_camera(self):
@@ -56,7 +57,11 @@ class UsbCameraTrack(VideoStreamTrack):
         vf.pts = pts
         vf.time_base = time_base
         self._frame_idx += 1
+        self.frame_id = self._frame_idx
         return vf
+
+    def get_frame_id(self) -> int:
+        return self.frame_id
 
     def stop(self):
         super().stop()
