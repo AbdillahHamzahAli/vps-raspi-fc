@@ -1,18 +1,44 @@
 [project]
 name = "vps-raspi-fc"
 version = "0.1.0"
-description = "WebRTC 2-arah VPS <-> Raspi: Raspi kirim frame USB cam -> VPS YOLO11s -> trigger DataChannel -> Raspi print"
+description = "WebRTC 2-arah VPS <-> Raspi: Raspi kirim frame USB cam -> VPS YOLO11s -> trigger DataChannel -> Raspi FC guided (pymavlink)"
 readme = "README.md"
 requires-python = ">=3.13"
+# base minimal (common) — install extra sesuai peran
 dependencies = [
+    "python-dotenv>=1.0.0",
+    "numpy>=1.26.0",
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+# VPS: YOLO + signaling + viewer
+vps = [
     "aiortc>=1.9.0",
     "av>=12.3.0",
     "opencv-python>=4.10.0",
-    "numpy>=1.26.0",
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.30.0",
+    "ultralytics>=8.3.0",
+    "aiohttp>=3.9.0",
+    "httpx>=0.27.0",
+]
+# Raspi: cam + FC (pymavlink), tanpa YOLO/fastapi
+raspi = [
+    "aiortc>=1.9.0",
+    "av>=12.3.0",
+    "opencv-python>=4.10.0",
+    "pymavlink>=2.4.40",
+    "pyserial>=3.5",
+]
+# Semua (dev / test 1 laptop)
+all = [
+    "aiortc>=1.9.0",
+    "av>=12.3.0",
+    "opencv-python>=4.10.0",
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.30.0",
     "websockets>=12.0",
-    "python-dotenv>=1.0.0",
     "ultralytics>=8.3.0",
     "aiohttp>=3.9.0",
     "httpx>=0.27.0",

@@ -26,11 +26,19 @@ Jaringan modem/CGNAT → wajib TURN (`coturn` di VPS). FC konek Raspi via USB/UA
 
 ## Quick Start
 
-### 1. Install deps
+### 1. Install deps (terpisah Raspi vs VPS)
 
 ```bash
-uv sync
 cp .env.example .env   # edit VPS_IP, TURN cred, FC_CONNECTION_STRING, API_KEY
+
+# Di VPS (butuh YOLO + FastAPI, tanpa pymavlink):
+uv sync --extra vps
+# Di Raspi (butuh pymavlink + cam, tanpa YOLO/FastAPI):
+uv sync --extra raspi
+# Dev / test 1 laptop (semua):
+uv sync --extra all
+# Minimal (common saja):
+uv sync
 ```
 
 ### 2. VPS — Signaling + TURN
