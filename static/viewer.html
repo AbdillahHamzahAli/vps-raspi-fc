@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>VPS-Raspi Viewer</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>#wrap{position:relative;display:inline-block}#overlay,#overlay-w{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}#stream{display:block;max-width:100%;background:#111}#webrtc-video{display:block;max-width:100%;background:#111}</style>
+</head>
+<body class="bg-zinc-950 text-zinc-100 min-h-screen">
+<header class="border-b border-zinc-800 sticky top-0 bg-zinc-950/80 backdrop-blur z-10">
+  <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+    <div>
+      <h1 class="font-semibold">VPS-Raspi Viewer <span class="text-zinc-500 font-normal">YOLO11s</span></h1>
+      <p class="text-xs text-zinc-500">Raspi → VPS (WebRTC) → Browser (MJPEG / WebRTC)</p>
+    </div>
+    <div class="flex gap-2 text-xs">
+      <span id="badge-ws" class="px-2 py-1 rounded bg-zinc-800 text-zinc-400">WS: …</span>
+      <span id="badge-fps" class="px-2 py-1 rounded bg-zinc-800 text-zinc-400">0 fps</span>
+      <span id="badge-webrtc" class="px-2 py-1 rounded bg-zinc-800 text-zinc-400">WebRTC: off</span>
+    </div>
+  </div>
+</header>
+<main class="max-w-6xl mx-auto px-4 py-6 grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-6">
+  <div>
+    <div class="flex gap-2 mb-3 text-xs">
+      <button id="btn-mjpeg" class="px-3 py-1.5 rounded bg-sky-600">MJPEG</button>
+      <button id="btn-webrtc" class="px-3 py-1.5 rounded bg-zinc-800">WebRTC low-latency</button>
+      <button id="btn-reload" class="px-3 py-1.5 rounded bg-zinc-800">Reload MJPEG</button>
+      <span id="info-res" class="self-center text-zinc-500">640×480</span>
+    </div>
+    <div id="wrap-mjpeg" class="rounded-lg overflow-hidden border border-zinc-800 bg-black">
+      <div id="wrap" class="w-full">
+        <img id="stream" src="/stream.mjpg" alt="stream"/>
+        <canvas id="overlay"></canvas>
+        <div id="no-signal" class="absolute inset-0 grid place-items-center bg-zinc-900 text-zinc-400 text-sm hidden"><div class="text-center">menunggu frame<br/><span class="text-xs text-zinc-500">pastikan raspi & vps connect</span></div></div>
+      </div>
+    </div>
+    <div id="wrap-webrtc" class="hidden rounded-lg overflow-hidden border border-zinc-800 bg-black relative">
+      <video id="webrtc-video" autoplay playsinline class="w-full bg-black"></video>
+      <canvas id="overlay-w"></canvas>
+    </div>
+    <p id="hint" class="text-xs text-zinc-500 mt-2">MJPEG ~300ms, WebRTC ~120ms. Klik WebRTC untuk latency rendah.</p>
+  </div>
+  <div class="space-y-4">
+    <div class="rounded-lg border border-zinc-800 bg-zinc-900 p-3">
+      <h2 class="text-sm font-medium mb-2">Status</h2>
+      <div class="text-xs font-mono space-y-1">
+        <div>peers: <span id="peers">-</span></div>
+        <div>last: <span id="last-ts">-</span></div>
+        <div>detections: <span id="det-count">0</span></div>
+      </div>
+    </div>
+    <div class="rounded-lg border border-zinc-800 bg-zinc-900 p-3">
+      <h2 class="text-sm font-medium mb-2">Detections</h2>
+      <div id="det-list" class="text-xs font-mono space-y-1 max-h-[320px] overflow-auto"></div>
+    </div>
+  </div>
+</main>
+<script>
+const img=document.getElementById('stream'),canvas=document.getElementById('overlay'),ctx=canvas.getContext('2d')
+const canvasW=document.getElementById('overlay-w'),ctxW=canvasW.getContext('2d')
+const noSignal=document.getElementById('no-signal'),badgeWs=document.getElementById('badge-ws'),badgeFps=document.getElementById('badge-fps'),badgeWrtc=document.getElementById('badge-webrtc')
+const peersEl=document.getElementById('peers'),lastTsEl=document.getElementById('last-ts'),detCountEl=document.getElementById('det-count'),detListEl=document.getElementById('det-list'),infoRes=document.getElementById('info-res')
+const wrapMjpeg=document.getElementById('wrap-mjpeg'),wrapWrtc=document.getElementById('wrap-webrtc'),webrtcVideo=document.getElementById('webrtc-video'),btnMjpeg=document.getElementById('btn-mjpeg'),btnWrtc=document.getElementById('btn-webrtc')
+let detections=[],frameSize={w:640,h:480},fpsCount=0,lastFps=Date.now(),viewerWs=null,pc=null,sigWs=null
+
+function resize(){[ [img,canvas,ctx],[webrtcVideo,canvasW,ctxW] ].forEach(([el,cv,ct])=>{if(!el)return;const r=el.getBoundingClientRect();if(!r.width)return;const d=window.devicePixelRatio||1;cv.width=r.width*d;cv.height=r.height*d;cv.style.width=r.width+'px';cv.style.height=r.height+'px';ct.setTransform(d,0,0,d,0,0)})}
+window.addEventListener('resize',()=>{resize();draw()})
+webrtcVideo.addEventListener('loadedmetadata',()=>{resize();draw()})
+img.addEventListener('load',()=>{resize();noSignal.classList.add('hidden');fpsCount++})
+img.addEventListener('error',()=>noSignal.classList.remove('hidden'))
+function drawBox(ct,el){const r=el.getBoundingClientRect();if(!r.width)return;ct.clearRect(0,0,r.width,r.height);if(!detections.length)return;const sx=r.width/frameSize.w,sy=r.height/frameSize.h;detections.forEach(d=>{const [x1,y1,x2,y2]=d.xyxy;const x=x1*sx,y=y1*sy,w=(x2-x1)*sx,h=(y2-y1)*sy;ct.strokeStyle='#22c55e';ct.lineWidth=2;ct.strokeRect(x,y,w,h);const label=`${d.cls} ${(d.conf*100).toFixed(0)}%`;ct.fillStyle='#22c55e';ct.font='12px monospace';const tw=ct.measureText(label).width;ct.fillRect(x,Math.max(0,y-16),tw+8,16);ct.fillStyle='#000';ct.fillText(label,x+4,y-4<4?y+h+12:y-4)})}
+function draw(){drawBox(ctx,img);drawBox(ctxW,webrtcVideo)}
+function connectViewerWs(){const proto=location.protocol==='https:'?'wss:':'ws:';viewerWs=new WebSocket(`${proto}//${location.host}/ws/viewer`);viewerWs.onopen=()=>badgeWs.textContent='WS: connected';viewerWs.onclose=()=>setTimeout(connectViewerWs,2000);viewerWs.onmessage=e=>{try{const m=JSON.parse(e.data);if(m.type==='state'||m.type==='detection'){detections=m.objects||[];frameSize={w:m.width||640,h:m.height||480};infoRes.textContent=`${frameSize.w}×${frameSize.h}`;lastTsEl.textContent=new Date(m.ts*1000).toLocaleTimeString();detCountEl.textContent=detections.length;detListEl.innerHTML=detections.map(d=>`<div class="flex justify-between"><span>${d.cls}</span><span>${(d.conf*100).toFixed(1)}% [${d.xyxy.join(',')}]</span></div>`).join('')||'<span class="text-zinc-500">-</span>';fpsCount++;draw()}if(m.type==='peers')peersEl.textContent=(m.peers||[]).join(', ')||'-'}catch{}}}
+connectViewerWs()
+setInterval(()=>{const dt=(Date.now()-lastFps)/1000;badgeFps.textContent=`${(fpsCount/dt).toFixed(1)} fps`;fpsCount=0;lastFps=Date.now()},1000)
+setInterval(async()=>{try{const r=await fetch('/peers');const j=await r.json();peersEl.textContent=(j.peers||[]).join(', ')||'-'}catch{}},3000)
+document.getElementById('btn-reload').onclick=()=>{const s=img.src;img.src='';setTimeout(()=>img.src=s+'?t='+Date.now(),100)}
+btnMjpeg.onclick=()=>setMode('mjpeg')
+btnWrtc.onclick=()=>setMode('webrtc')
+function setMode(m){mode=m;if(m==='mjpeg'){wrapMjpeg.classList.remove('hidden');wrapWrtc.classList.add('hidden');btnMjpeg.className='px-3 py-1.5 rounded bg-sky-600';btnWrtc.className='px-3 py-1.5 rounded bg-zinc-800';if(pc){try{pc.close()}catch{};pc=null;badgeWrtc.textContent='WebRTC: off';badgeWrtc.className='px-2 py-1 rounded bg-zinc-800 text-zinc-400'}}else{wrapMjpeg.classList.add('hidden');wrapWrtc.classList.remove('hidden');btnWrtc.className='px-3 py-1.5 rounded bg-violet-600';btnMjpeg.className='px-3 py-1.5 rounded bg-zinc-800';connectWebRTC()}}
+async function connectWebRTC(){
+  if(pc) try{pc.close()}catch{}
+  badgeWrtc.textContent='WebRTC: connecting…'
+  const id='viewer-'+Math.random().toString(36).slice(2,7)
+  const proto=location.protocol==='https:'?'wss:':'ws:'
+  let iceServers=[{urls:'stun:stun.l.google.com:19302'}]
+  try{const r=await fetch('/api/ice');const j=await r.json();if(j.iceServers?.length) iceServers=j.iceServers}catch{}
+  sigWs=new WebSocket(`${proto}//${location.host}/ws/${id}`)
+  await new Promise((res,rej)=>{sigWs.onopen=res;sigWs.onerror=rej})
+  pc=new RTCPeerConnection({iceServers})
+  pc.ontrack=e=>{webrtcVideo.srcObject=e.streams[0];badgeWrtc.textContent='WebRTC: connected';badgeWrtc.className='px-2 py-1 rounded bg-emerald-600 text-white'}
+  pc.onconnectionstatechange=()=>{if(['failed','disconnected','closed'].includes(pc.connectionState)){badgeWrtc.textContent='WebRTC: '+pc.connectionState;badgeWrtc.className='px-2 py-1 rounded bg-zinc-800 text-zinc-400'}}
+  pc.addTransceiver('video',{direction:'recvonly'})
+  sigWs.onmessage=async e=>{
+    const m=JSON.parse(e.data)
+    if(m.type==='answer'&&m.sdp){await pc.setRemoteDescription({type:'answer',sdp:m.sdp})}
+    if(m.type==='candidate'&&m.candidate){try{await pc.addIceCandidate({candidate:m.candidate,sdpMid:m.sdpMid,sdpMLineIndex:m.sdpMLineIndex})}catch{}}
+  }
+  const offer=await pc.createOffer()
+  await pc.setLocalDescription(offer)
+  sigWs.send(JSON.stringify({type:'offer',sdp:pc.localDescription.sdp,sdpType:pc.localDescription.type,target:'vps'}))
+  pc.onicecandidate=e=>{if(e.candidate)sigWs.send(JSON.stringify({type:'candidate',candidate:e.candidate.candidate,sdpMid:e.candidate.sdpMid,sdpMLineIndex:e.candidate.sdpMLineIndex,target:'vps'}))}
+}
+resize()
+</script>
+</body>
+</html>
