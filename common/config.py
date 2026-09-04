@@ -55,3 +55,11 @@ DETECTION_SAVE_DIR = os.getenv("DETECTION_SAVE_DIR", "data/detections")
 DETECTION_SAVE_THROTTLE_MS = int(os.getenv("DETECTION_SAVE_THROTTLE_MS", "1000"))
 GUIDED_ALT_DEFAULT = float(os.getenv("GUIDED_ALT_DEFAULT", "20"))
 API_KEY = os.getenv("API_KEY", "secret")
+
+# --- Video record (VPS) ---
+VIDEO_SAVE_DIR = os.getenv("VIDEO_SAVE_DIR", "data/videos")
+VIDEO_SAVE_FPS = int(os.getenv("VIDEO_SAVE_FPS", "20"))  # fixed 20
+VIDEO_MAX_S = int(os.getenv("VIDEO_MAX_S", "3600"))  # max 1 jam per record
+VIDEO_MAX_GB = float(os.getenv("VIDEO_MAX_GB", "20"))
+VIDEO_CONTAINER = os.getenv("VIDEO_CONTAINER", "mkv")  # mkv
+VIDEO_CODEC = os.getenv("VIDEO_CODEC", "h264")  # h264 hemat+compatible

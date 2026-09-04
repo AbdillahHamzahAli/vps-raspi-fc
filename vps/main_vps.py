@@ -20,6 +20,7 @@ from common.config import (
 from common.signaling import SignalingClient
 from vps.detector import get_detector
 from vps.storage import save_detection
+from vps.video_recorder import VideoRecorder
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vps")
@@ -107,6 +108,16 @@ async def run():
     detector = get_detector()
     data_channel = None  # commands DC (reliable)
     telemetry_dc = None  # telemetry DC (unreliable) - for logging only
+    recorder = VideoRecorder()
+
+    async def recorder_poller():
+        while True:
+            try:
+                await recorder.poll_and_update()
+            except Exception as e:
+                logger.debug(f"[video] poll error {e}")
+            await asyncio.sleep(0.5)
+    asyncio.create_task(recorder_poller())
 
     # Telemetry buffer: frame_id -> coords, plus latest
     telemetry_buffer: OrderedDict[int, dict] = OrderedDict()
@@ -206,6 +217,14 @@ async def run():
                     bgr = frame.to_ndarray(format="bgr24")
                 except:
                     continue
+
+                # raw video record mkv h264 20fps until stop (max 1 jam) — raw, bukan annotated
+                if recorder.container is not None:
+                    try:
+                        # fixed 20fps: write every frame (VIDEO_SAVE_FPS==VIDEO_FPS==20), else throttle if needed
+                        await recorder.write(bgr)
+                    except Exception as e:
+                        logger.debug(f"[video] write error {e}")
 
                 if BROWSER_VIEWER_ENABLED and now - last_view_ms >= viewer_interval_ms:
                     last_view_ms = now
@@ -357,6 +376,10 @@ async def run():
 
     if viewer_session:
         await viewer_session.close()
+    try:
+        await recorder.close()
+    except:
+        pass
     await raspi_pc.close()
     for pc in viewer_pcs.values():
         try: await pc.close()

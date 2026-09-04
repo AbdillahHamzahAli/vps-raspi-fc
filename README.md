@@ -134,10 +134,34 @@ curl -X POST -H "X-API-Key: secret" -H "Content-Type: application/json" \
 ```
 Raspi `raspi/pkg.Vehicle` akan `set_mode GUIDED` → `mission_item_int_send` → `MISSION_ACK`. Cek MP HUD mode GUIDED.
 
+### Video Record MKV (raw 20fps max 1 jam, h264 mkv)
+```bash
+# start (buat file data/videos/YYYYMMDD_HHMMSS.mkv, max 1 jam auto-stop)
+curl -X POST -H "X-API-Key: secret" http://VPS_IP:8000/api/videos/start | jq
+# {"ok":true,"id":"20260903_143000","path":"/videos/20260903_143000.mkv","fps":20,"codec":"h264"}
+
+# cek state
+curl -H "X-API-Key: secret" http://VPS_IP:8000/api/videos/state | jq
+# {"recording":true,"elapsed_s":123}
+
+# start lagi saat recording → 409
+curl -X POST -H "X-API-Key: secret" http://VPS_IP:8000/api/videos/start | jq
+# {"ok":false,"error":"already recording"}
+
+# stop (manual, atau auto 3600s)
+curl -X POST -H "X-API-Key: secret" http://VPS_IP:8000/api/videos/stop | jq
+# {"ok":true,"size_mb":12.3,"duration_s":123}
+
+# list & download
+curl -H "X-API-Key: secret" "http://VPS_IP:8000/api/videos?limit=10" | jq
+curl -H "X-API-Key: secret" http://VPS_IP:8000/videos/20260903_143000.mkv --output rec.mkv
+# ffprobe rec.mkv | grep h264
+```
+
 ### Health
 ```bash
 curl http://VPS_IP:8000/ | jq
-# {"status":"ok","peers":["raspi","vps"],"detections":12,"raspi_connected":true}
+# {"status":"ok","peers":["raspi","vps"],"detections":12,"videos":3,"video_state":{"recording":true},"raspi_connected":true}
 ```
 
 ## Storage

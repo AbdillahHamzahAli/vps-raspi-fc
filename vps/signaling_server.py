@@ -9,7 +9,7 @@ from typing import Dict, Set, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Header, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from common.config import get_ice_servers, API_KEY, DETECTION_SAVE_DIR, GUIDED_ALT_DEFAULT
+from common.config import get_ice_servers, API_KEY, DETECTION_SAVE_DIR, GUIDED_ALT_DEFAULT, VIDEO_SAVE_DIR, VIDEO_MAX_S
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("signaling")
@@ -42,6 +42,14 @@ try:
 except Exception as e:
     logger.warning(f"[api] mount detections failed {e}")
 
+# Video storage mount (mkv)
+VIDEO_DIR = Path(VIDEO_SAVE_DIR).resolve()
+try:
+    VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+    app.mount("/videos", StaticFiles(directory=str(VIDEO_DIR)), name="videos")
+except Exception as e:
+    logger.warning(f"[api] mount videos failed {e}")
+
 
 def require_api_key(x_api_key: str | None = Header(None), authorization: str | None = Header(None)):
     # support X-API-Key or Authorization: Bearer <key>
@@ -62,7 +70,14 @@ async def health():
         det_count = count_detections()
     except:
         det_count = -1
-    return {"status": "ok", "peers": list(peers.keys()), "viewer": "/viewer", "stream": "/stream.mjpg", "detections": det_count, "raspi_connected": "raspi" in peers}
+    try:
+        from vps.video_recorder import get_state as video_state, count_videos
+        v_state = video_state()
+        v_count = count_videos()
+    except:
+        v_state = {"recording": False}
+        v_count = -1
+    return {"status": "ok", "peers": list(peers.keys()), "viewer": "/viewer", "stream": "/stream.mjpg", "detections": det_count, "videos": v_count, "video_state": v_state, "raspi_connected": "raspi" in peers}
 
 @app.get("/peers")
 async def list_peers():
@@ -153,6 +168,91 @@ async def api_post_guided(req: Request, x_api_key: str | None = Header(None), au
         return {"ok": True, "via": "ws", "sent": payload, "dc_result": dc_result}
     except Exception as e:
         logger.exception(f"[api] guided WS send failed {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+# ---- Video record API (mkv h264 raw 20fps max 1 jam, start/stop) ----
+@app.get("/api/videos/state")
+async def api_video_state(x_api_key: str | None = Header(None), authorization: str | None = Header(None)):
+    require_api_key(x_api_key, authorization)
+    try:
+        from vps.video_recorder import get_state
+        return {"ok": True, "state": get_state()}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/videos")
+async def api_list_videos(limit: int = 50, offset: int = 0, x_api_key: str | None = Header(None), authorization: str | None = Header(None)):
+    require_api_key(x_api_key, authorization)
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    try:
+        from vps.video_recorder import list_videos, count_videos, total_size_mb
+        items = list_videos(limit=limit, offset=offset)
+        return {"ok": True, "total": count_videos(), "total_size_mb": total_size_mb(), "limit": limit, "offset": offset, "items": items}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/videos/start")
+async def api_video_start(x_api_key: str | None = Header(None), authorization: str | None = Header(None)):
+    require_api_key(x_api_key, authorization)
+    try:
+        from vps.video_recorder import is_recording, set_state, get_state
+        if is_recording():
+            return JSONResponse({"ok": False, "error": "already recording", "state": get_state()}, status_code=409)
+        # create file path YYYYMMDD_HHMMSS.mkv
+        ts = time.time()
+        name = time.strftime("%Y%m%d_%H%M%S", time.localtime(ts))
+        # avoid collision same second
+        base = VIDEO_DIR / f"{name}.mkv"
+        idx = 0
+        path = base
+        while path.exists():
+            idx += 1
+            path = VIDEO_DIR / f"{name}_{idx}.mkv"
+        set_state(str(path), ts)
+        logger.info(f"[video] start {path}")
+        return {"ok": True, "id": path.stem, "path": f"/videos/{path.name}", "file": path.name, "start_ts": ts, "fps": 20, "codec": "h264", "container": "mkv", "max_s": VIDEO_MAX_S}
+    except Exception as e:
+        logger.exception(f"[video] start failed {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/videos/stop")
+async def api_video_stop(x_api_key: str | None = Header(None), authorization: str | None = Header(None)):
+    require_api_key(x_api_key, authorization)
+    try:
+        from vps.video_recorder import is_recording, clear_state, get_state
+        state = get_state()
+        if not state.get("recording"):
+            return JSONResponse({"ok": False, "error": "not recording", "state": state}, status_code=400)
+        # clear marker, main_vps will close within 0.5s
+        old = clear_state()
+        # wait up to 2s for file to be closed (poll)
+        path = Path(old.get("path", "")) if old else None
+        for _ in range(20):
+            await asyncio.sleep(0.1)
+            if path and path.exists():
+                # file should be finalized; check if recording cleared
+                if not is_recording():
+                    break
+        # gather info
+        info = {"ok": True, "stopped": True, "previous": old}
+        if path and path.exists():
+            try:
+                st = path.stat()
+                info["file"] = path.name
+                info["path"] = f"/videos/{path.name}"
+                info["size_mb"] = round(st.st_size / 1024 / 1024, 2)
+                info["duration_s"] = round(time.time() - float(old.get("start_ts", time.time())), 1) if old else None
+            except:
+                pass
+        logger.info(f"[video] stop {path}")
+        return info
+    except Exception as e:
+        logger.exception(f"[video] stop failed {e}")
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 @app.get("/viewer", response_class=HTMLResponse)

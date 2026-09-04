@@ -12,6 +12,7 @@ wheels/
 # Project
 .env
 data/detections/
+data/videos/
 !data/.gitkeep
 yolo11*.pt
 *.pt
