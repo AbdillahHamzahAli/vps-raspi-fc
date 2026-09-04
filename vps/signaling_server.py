@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, Set, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from common.config import get_ice_servers, API_KEY, DETECTION_SAVE_DIR, GUIDED_ALT_DEFAULT, VIDEO_SAVE_DIR, VIDEO_MAX_S
@@ -15,6 +16,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("signaling")
 
 app = FastAPI(title="VPS-Raspi Signaling + Viewer")
+# allow_credentials harus False bila allow_origins=["*"] — jika True browser menolak preflight X-API-Key
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
 peers: Dict[str, WebSocket] = {}
 
 latest_jpeg: Optional[bytes] = None
@@ -27,6 +37,10 @@ viewer_clients: Set[WebSocket] = set()
 _frame_lock = asyncio.Lock()
 _new_frame_event = asyncio.Event()
 _frame_version = 0
+
+# SSE live detection per-hari
+sse_clients: Set[asyncio.Queue] = set()
+sse_clients_lock = asyncio.Lock()
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 try:
@@ -83,25 +97,127 @@ async def health():
 async def list_peers():
     return {"peers": list(peers.keys())}
 
+
+# ---- SSE live detection per-hari (id only, live only) ----
+@app.get("/api/detections/stream")
+async def sse_detections_stream(request: Request, token: str | None = None):
+    # EventSource tidak bisa header X-API-Key, pakai ?token=secret
+    if token != API_KEY:
+        # also allow header bearer for curl testing
+        hdr = request.headers.get("x-api-key") or request.headers.get("authorization", "")
+        if hdr.lower().startswith("bearer "):
+            hdr = hdr[7:].strip()
+        if hdr != API_KEY:
+            raise HTTPException(status_code=401, detail="invalid token, use ?token=API_KEY")
+    # per-hari paling baru: today Asia/Jakarta
+    import datetime
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async with sse_clients_lock:
+        sse_clients.add(queue)
+
+    async def gen():
+        try:
+            # live only: tidak replay history, hanya push baru
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=15)
+                    # filter per-hari terbaru (live only)
+                    # item is {"id":...,"date":YYYY-MM-DD} dari internal
+                    if item.get("date") and item["date"] != today:
+                        continue
+                    # jika item tanpa date (legacy), tetap kirim
+                    payload = json.dumps({"id": item.get("id")})
+                    yield f"data: {payload}\n\n"
+                except asyncio.TimeoutError:
+                    # heartbeat agar proxy tidak close (comment line)
+                    yield ": ping\n\n"
+        finally:
+            async with sse_clients_lock:
+                sse_clients.discard(queue)
+
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+
+
+@app.post("/api/internal/new_detection")
+async def internal_new_detection(request: Request):
+    # allow 127.0.0.1 tanpa token, atau qualquer host dengan ?token=API_KEY (untuk testing)
+    client_host = request.client.host if request.client else ""
+    token_q = request.query_params.get("token") or request.headers.get("x-api-key") or ""
+    # if token matches, allow dari mana saja
+    allow_via_token = token_q == API_KEY
+    if client_host not in ("127.0.0.1", "::1", "testclient") and not allow_via_token:
+        raise HTTPException(status_code=403, detail="internal only 127.0.0.1 (or use ?token=API_KEY)")
+    try:
+        data = await request.json()
+    except:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+    # also allow token in body
+    if not allow_via_token and data.get("token") == API_KEY:
+        allow_via_token = True
+        if client_host not in ("127.0.0.1", "::1", "testclient"):
+            logger.warning(f"[sse] internal called from {client_host} with body token, allowed for test")
+    det_id = data.get("id")
+    if not det_id:
+        return JSONResponse({"ok": False, "error": "id required"}, status_code=400)
+    # enrich date per-hari
+    date = data.get("date")
+    if not date:
+        # try load from storage to get date
+        try:
+            from vps.storage import get_detection
+            item = get_detection(det_id)
+            if item:
+                date = item.get("date") or time.strftime("%Y-%m-%d", time.localtime(item.get("ts", time.time())))
+        except:
+            date = time.strftime("%Y-%m-%d")
+    item = {"id": det_id, "date": date}
+    # broadcast ke semua SSE client (per-hari filter di gen())
+    async with sse_clients_lock:
+        for q in list(sse_clients):
+            try:
+                q.put_nowait(item)
+            except:
+                pass
+    return {"ok": True, "broadcast": len(sse_clients), "item": item}
+
 @app.get("/api/ice")
 async def api_ice():
     return {"iceServers": get_ice_servers()}
 
 
 # ---- Detection + Guided API ----
-@app.get("/api/detections")
-async def api_list_detections(limit: int = 50, offset: int = 0, x_api_key: str | None = Header(None), authorization: str | None = Header(None)):
+@app.get("/api/detections/days")
+async def api_list_detection_days(x_api_key: str | None = Header(None), authorization: str | None = Header(None)):
     require_api_key(x_api_key, authorization)
-    # defensive bounds
+    try:
+        from vps.storage import list_days, migrate_flat_to_days
+        # lazy migrate flat lama
+        migrate_flat_to_days()
+        days = list_days()
+        return {"ok": True, "days": days, "total_days": len(days)}
+    except Exception as e:
+        logger.exception(f"[api] list days failed {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/detections")
+async def api_list_detections(limit: int = 50, offset: int = 0, date: str | None = None, x_api_key: str | None = Header(None), authorization: str | None = Header(None)):
+    require_api_key(x_api_key, authorization)
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
     try:
-        from vps.storage import list_detections
-        items = list_detections(limit=limit, offset=offset)
-        # also get total
-        from vps.storage import count_detections
-        total = count_detections()
-        return {"ok": True, "total": total, "limit": limit, "offset": offset, "items": items}
+        from vps.storage import list_detections, count_detections, migrate_flat_to_days
+        migrate_flat_to_days()
+        items = list_detections(limit=limit, offset=offset, date=date)
+        total = count_detections(date=date)
+        return {"ok": True, "total": total, "limit": limit, "offset": offset, "date": date, "items": items}
+    except ValueError as ve:
+        return JSONResponse({"ok": False, "error": str(ve)}, status_code=400)
     except Exception as e:
         logger.exception(f"[api] list detections failed {e}")
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)

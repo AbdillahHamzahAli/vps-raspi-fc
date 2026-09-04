@@ -292,13 +292,20 @@ async def run():
 
                     # annotated copy for storage
                     try:
-                        # create annotated for saving (if not already)
-                        ann_save = bgr.copy()
-                        for d in dets:
-                            x1, y1, x2, y2 = d["xyxy"]
-                            cv2.rectangle(ann_save, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                            cv2.putText(ann_save, f"{d['cls']} {d['conf']:.2f}", (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                        asyncio.create_task(save_detection(bgr, dets, coords, frame_count))
+                        coro = save_detection(bgr, dets, coords, frame_count)
+                        # wrap to also broadcast SSE id-only per-hari
+                        async def _save_and_broadcast():
+                            payload = await coro
+                            if payload and payload.get("id"):
+                                try:
+                                    import aiohttp
+                                    http_base = get_signaling_http_base()
+                                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2)) as sess:
+                                        await sess.post(f"{http_base}/api/internal/new_detection", json={"id": payload["id"], "date": payload.get("date")})
+                                    logger.debug(f"[sse] broadcast {payload['id']}")
+                                except Exception as e:
+                                    logger.debug(f"[sse] broadcast failed {e}")
+                        asyncio.create_task(_save_and_broadcast())
                     except Exception as e:
                         logger.warning(f"[vps] save_detection error {e}")
         asyncio.create_task(consume())
